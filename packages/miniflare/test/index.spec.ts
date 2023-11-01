@@ -584,6 +584,71 @@ test("Miniflare: custom upstream as origin", async (t) => {
   t.is(await res.text(), "upstream: http://upstream/extra/path?a=1");
 });
 
+import { MockAgent, setGlobalDispatcher } from "undici";
+
+test.only("Miniflare Bug?: custom upstream has no body with fetchMock + enableNetConnect", async (t) => {
+  const upstream = (
+    await useServer(t, async (req, res) => {
+      let body = "";
+      req
+        .on("data", (chunk) => {
+          body += chunk;
+        })
+        .on("end", () => {
+          res.end(body);
+        });
+    })
+  ).http;
+
+  const fetchMock = new MockAgent({
+    // commenting out `strictContentLength` makes undici
+    // throw UND_ERR_REQ_CONTENT_LENGTH_MISMATCH on request to `upstreamHostname`
+    // because it expects a body thats not there
+    strictContentLength: false,
+  });
+  setGlobalDispatcher(fetchMock);
+  const origin = fetchMock.get("https://example.com");
+  origin.intercept({ method: "GET", path: "/" }).reply(200, "Mocked response!");
+
+  const upstreamHostname = `${upstream.hostname}:${upstream.port}`;
+  fetchMock.enableNetConnect(upstreamHostname);
+
+  // we confirm the server works as expected outside of miniflare
+  const response = await fetch(upstream.href, {
+    method: "PATCH",
+    body: "Upstream response!",
+  });
+  t.is(await response.text(), "Upstream response!");
+
+  const mf = new Miniflare({
+    upstream: upstream.toString(),
+    fetchMock,
+    modules: true,
+    script: `export default {
+      async fetch(request) {       
+        try {
+          return fetch(request.url, {
+            method: "PATCH",
+            body: "Upstream response!",
+          })
+        } catch (e) {
+          // this is thrown if you remove the "strictContentLength" option from MockAgent
+          console.log('upstream error', e)
+          return new Response('it broke')
+        }
+      }
+    }`,
+  });
+
+  t.teardown(() => mf.dispose());
+  const res = await mf.dispatchFetch("http://localhost:8787");
+  // The following assertion is failing
+  //   Difference (- actual, + expected):
+  // - ''
+  // + 'Upstream response!'
+  t.is(await res.text(), "Upstream response!");
+});
+
 test("Miniflare: `node:`, `cloudflare:` and `workerd:` modules", async (t) => {
   const mf = new Miniflare({
     modules: true,
